@@ -47,15 +47,27 @@ try:
     _triton, _tl = _load()
 
     @_triton.jit
-    def _cutfill(S, NRM, RANK, ORD, ENC, OUTK, OUTI, THR, LIVE, stride_s, n_cols, k,
+    def _cutfill(S, NRM, CNRM, RANK, ORD, ENC, OUTK, OUTI, THR, LIVE, stride_s, n_cols, k,
                  BLOCK: _tl.constexpr, RBITS: _tl.constexpr,
-                 HAS_NRM: _tl.constexpr, HAS_THR: _tl.constexpr,
-                 HAS_ENC: _tl.constexpr):
+                 HAS_NRM: _tl.constexpr, HAS_CNRM: _tl.constexpr,
+                 HAS_THR: _tl.constexpr, HAS_ENC: _tl.constexpr):
         row = _tl.program_id(0)
         offs = _tl.arange(0, BLOCK)
         m = offs < n_cols
 
         s = _tl.load(S + row * stride_s + offs, mask=m, other=float("-inf"))
+        if HAS_CNRM:
+            # Fuse cosine's per-CORPUS-ROW norm divide into the score load.
+            #
+            # ORDER IS LOAD BEARING: the unfused path divides by the corpus norm
+            # BEFORE the query norm (`_scores` then the packer). Float division
+            # is not associative, so swapping these changes results. Keep the
+            # corpus divide above the query divide.
+            #
+            # This must be a DIVIDE, never a multiply by a precomputed
+            # reciprocal: x * (1/n) != x / n, which would change the exact fp32
+            # path the two-pass bound is defined against.
+            s = _tl.math.div_rn(s, _tl.load(CNRM + offs, mask=m, other=1.0))
         if HAS_NRM:
             # Fuse cosine's per-query norm divide into the score load, avoiding a
             # separate read/write pass over the score matrix.
@@ -242,10 +254,10 @@ def _shape_of(t) -> str:
 _DECLINE_LOGGED = False
 
 
-def available(scores, ordinal, k, scale=None, thr=None, enc=None) -> bool:
+def available(scores, ordinal, k, scale=None, thr=None, enc=None, cscale=None) -> bool:
     """Is the kernel usable for THIS call? Anything false falls back.
     """
-    ok = _available(scores, ordinal, k, scale, thr, enc)
+    ok = _available(scores, ordinal, k, scale, thr, enc, cscale)
     global _DECLINE_LOGGED
     if not ok and not _DECLINE_LOGGED:
         _DECLINE_LOGGED = True
@@ -253,7 +265,7 @@ def available(scores, ordinal, k, scale=None, thr=None, enc=None) -> bool:
             "tie-break top-K: the Triton kernel does not apply to this run "
             "(scores %s, k=%s%s) — using the portable path, which computes the "
             "identical answer roughly 4x slower. Logged once.",
-            _shape_of(scores), k, _why_declined(scores, ordinal, k, scale, thr, enc),
+            _shape_of(scores), k, _why_declined(scores, ordinal, k, scale, thr, enc, cscale),
         )
     return ok
 
@@ -275,7 +287,7 @@ def _enc_ok(enc, n_cols: int, device) -> bool:
     )
 
 
-def _why_declined(scores, ordinal, k, scale, thr, enc) -> str:
+def _why_declined(scores, ordinal, k, scale, thr, enc, cscale=None) -> str:
     """Return the first reason the Triton top-K path is unavailable. 
     
     Checks should stay in the same order as `_available` so the 
@@ -320,7 +332,7 @@ def _why_declined(scores, ordinal, k, scale, thr, enc) -> str:
     return ""
 
 
-def _available(scores, ordinal, k, scale=None, thr=None, enc=None) -> bool:
+def _available(scores, ordinal, k, scale=None, thr=None, enc=None, cscale=None) -> bool:
     """`available`'s body — see there.
 
     This is the contract boundary: everything the kernel ASSUMES is checked
@@ -360,6 +372,15 @@ def _available(scores, ordinal, k, scale=None, thr=None, enc=None) -> bool:
         scale.ndim == 1 and scale.numel() == n_q
         and scale.dtype is torch.float32 and scale.is_contiguous()
         and scale.device == scores.device
+    ):
+        return False
+    # cscale is indexed by COLUMN, so it must be n_cols long -- a length check
+    # against n_q would pass silently for square blocks and read out of bounds
+    # everywhere else.
+    if cscale is not None and not (
+        cscale.ndim == 1 and cscale.numel() == n_cols
+        and cscale.dtype is torch.float32 and cscale.is_contiguous()
+        and cscale.device == scores.device
     ):
         return False
     if thr is not None and not (
@@ -411,11 +432,12 @@ def rank_of(ordinal):
     return rank
 
 
-def topk(scores, ordinal, k, scale=None, thr=None, enc=None, rank=None):
+def topk(scores, ordinal, k, scale=None, thr=None, enc=None, rank=None, cscale=None):
     """Select top-K packed `(score, ordinal)` keys per query row.
 
     Returns `(keys, values, live)`. `values` contains `enc[column]` when
-    provided, otherwise column indices. `scale` applies a per-query divisor and
+    provided, otherwise column indices. `scale` applies a per-query divisor,
+    `cscale` a per-COLUMN (corpus-row) divisor applied BEFORE `scale`, and
     `thr` enables pruning.
 
     Dead rows have undefined outputs when pruning; callers must gate on `live`.
@@ -460,6 +482,7 @@ def topk(scores, ordinal, k, scale=None, thr=None, enc=None, rank=None):
             # THR/LIVE placeholders when unpruned, and as ENC when the caller
             # wants column indices back.
             scores, scale if scale is not None else scores,
+            cscale if cscale is not None else scores,
             rank, ordinal.contiguous(),
             enc if enc is not None else scores,
             outk, outi,
@@ -469,6 +492,7 @@ def topk(scores, ordinal, k, scale=None, thr=None, enc=None, rank=None):
             BLOCK=_block,
             RBITS=max(1, int(n_cols).bit_length()),   # w lands in [1, n_cols]
             HAS_NRM=scale is not None,
+            HAS_CNRM=cscale is not None,
             HAS_THR=thr is not None,
             HAS_ENC=enc is not None,
             num_warps=_warps_for(_block),  # 4 spills at BLOCK=8192; 8 does not.

@@ -794,12 +794,45 @@ def _sparse_scores(Q, Cb, q_cache=None):
     _SPARSE_BRANCHES["scored_fallback"] += 1
     return torch.matmul(Cb, Q.t().contiguous()).T
 
+# Tracks whether corpus-norm fusion actually ran; useful for benchmark gating.
+_FUSE_CNORM = {"applied": 0, "skipped": 0}
 
-def _scores(Q, C, metric: str, q_norms=None, scale_in_packer: bool = False):
+
+def fuse_cnorm_stats() -> dict:
+    return dict(_FUSE_CNORM)
+
+
+def fuse_cnorm() -> bool:
+    """Whether cosine's corpus-norm divide is fused into top-K packing.
+
+    Enabled by default. When enabled, `_scores` returns the raw Gram and
+    `pack`/`pack_topk` applies `cscale` during top-K instead of materializing
+    a separate normalized score matrix.
+
+    Set `NOVA_BF_FUSE_CNORM=0` (or false/no/off) to disable.
+    """
+    # Parse the value explicitly: bool("0") is True.
+    v = os.environ.get("NOVA_BF_FUSE_CNORM")
+    if v is None:
+        return True
+    return v.strip().lower() not in ("0", "false", "no", "off")
+
+def _scores(Q, C, metric: str, q_norms=None, scale_in_packer: bool = False,
+            cnorm_in_packer: bool = False):
     if metric == "cosine":
-        # Compute dot products first, then apply corpus normalization. This avoids
-        # per-component rounding from pre-normalizing C and preserves exact ties
-        # more reliably, while matching DenseBatchSlice's shared-Gram path.
+        # Normalize after GEMM to avoid rounding from pre-normalizing C and to
+        # match DenseBatchSlice's shared-Gram path.
+        if cnorm_in_packer:
+            # Preserve the unfused order: corpus divide, then query divide.
+            # Deferring only the corpus divide would reverse them and can
+            # change low bits that affect tie ordering.
+            if q_norms is not None and not scale_in_packer:
+                raise ValueError(
+                    "cnorm_in_packer requires scale_in_packer when q_norms is "
+                    "given: corpus normalization must precede query normalization"
+                )
+            return Q @ C.T
+        
         raw = (Q @ C.T).div_(C.norm(dim=1).clamp_min(1e-12)[None, :])
         if scale_in_packer:
             # The packer already scaled the scores, so no need to
@@ -1061,9 +1094,16 @@ class DenseBatchSlice:
             self._c_norms_raw = self.Cb.norm(dim=1)
         return self._c_norms_raw
 
-    def score(self, Q, metric: str, q_norms=None, scale_in_packer: bool = False):
+    def score(self, Q, metric: str, q_norms=None, scale_in_packer: bool = False,
+              cnorm_in_packer: bool = False):
         if not self.share_gram:
-            return _scores(Q, self.Cb, metric, q_norms, scale_in_packer=scale_in_packer)
+            return _scores(Q, self.Cb, metric, q_norms,
+                           scale_in_packer=scale_in_packer,
+                           cnorm_in_packer=cnorm_in_packer)
+
+        if cnorm_in_packer:
+            raise ValueError("cnorm_in_packer is not supported on the "
+                             "shared-Gram path; gate on `share_gram`")
         if self._raw is None:
             self._raw = Q @ self.Cb.T
         raw = self._raw
@@ -3141,6 +3181,27 @@ def _process_batch_group(
             scale_in_packer = spec_cos_scale[m] is not None
             score_key = (s.metric, scale_in_packer)
             plan = tp_plan.get(score_key)
+            # Defer cosine's corpus-norm divide to the packer? Every gate here
+            # is load bearing:
+            #   metric      - only cosine has a corpus-norm divide to defer.
+            #   plan None   - the two-pass hands over an already-built compact
+            #                 score matrix; its rows did not come through this
+            #                 `_scores` call, so the divide is already applied.
+            #   share_gram  - that path caches one raw Gram across metrics and
+            #                 normalises per metric (see `score`).
+            #   scale_in_p. - the corpus divide must precede the query divide;
+            #                 deferring only one of them reverses the order.
+            #   dense slice - `sl` is polymorphic over dense/sparse/multivector
+            #                 slices and only the dense one has a corpus-norm
+            #                 divide to defer, so only it accepts the keyword.
+            fuse_cn = (
+                fuse_cnorm()
+                and isinstance(sl, DenseBatchSlice)
+                and s.metric == "cosine"
+                and plan is None
+                and scale_in_packer
+                and not getattr(sl, "share_gram", False)
+            )
             scores = None
             if plan is None:
                 scores = score_cache.get(score_key)
@@ -3148,6 +3209,7 @@ def _process_batch_group(
                     scores = sl.score(
                         spec_Q[m], s.metric, spec_q_norms[m],
                         scale_in_packer=scale_in_packer,
+                        **({"cnorm_in_packer": True} if fuse_cn else {}),
                     )
                     if score_share_count[score_key] > 1:
                         score_cache[score_key] = scores
@@ -3186,6 +3248,19 @@ def _process_batch_group(
                     None if spec_cos_scale[m] is None
                     else spec_cos_scale[m].index_select(0, dst)
                 )
+            # Per-column divisor for the fused path. MUST be subset by
+            # `sel_cols` exactly as the score columns were, or the divisor no
+            # longer lines up with the scores it divides.
+            cscale = None
+            if fuse_cn and plan is None:
+                cn = sl.col_norms()
+                cscale = (cn if sel_cols is None else cn[sel_cols]).contiguous()
+                _FUSE_CNORM["applied"] += 1
+            elif fuse_cnorm() and s.metric == "cosine":
+                # Flag on but a gate refused -- record it so a perf run can tell
+                # "no speedup" apart from "never ran".
+                _FUSE_CNORM["skipped"] += 1
+
             sel_encoded = encoded_rows if sel_cols is None else encoded_rows[sel_cols]
             sel_ordinals = (ordinals if sel_cols is None
                             else _subset_for(subset_cache, ordinals, sel_cols))
@@ -3209,9 +3284,12 @@ def _process_batch_group(
                 part_key, part_enc, live = pack_topk(
                     sel_scores, sel_ordinals, s.k, cos_scale,
                     thr=thr_m if prune else None,
-                    encoded=sel_encoded, rank=sel_rank)
+                    encoded=sel_encoded, rank=sel_rank,
+                    **({"cscale": cscale} if cscale is not None else {}))
             else:
-                part_key = pack(sel_scores, sel_ordinals, cos_scale)
+                part_key = (pack(sel_scores, sel_ordinals, cos_scale, cscale)
+                            if cscale is not None
+                            else pack(sel_scores, sel_ordinals, cos_scale))
                 part_enc = sel_encoded
                 # Narrow slices apply the same prune rule after packing.
                 if prune:

@@ -100,7 +100,7 @@ def unpack_score(packed):
     return _order_key_to_bits(key).view(torch.float32)
 
 
-def pack(scores, ordinal, scale=None):
+def pack(scores, ordinal, scale=None, cscale=None):
     """Pack float32 scores and ordinals into sortable int64 keys.
 
     Higher scores sort first; exact ties use lower ordinals. Scores occupy the
@@ -116,6 +116,13 @@ def pack(scores, ordinal, scale=None):
             "silently reshapes the packed key. nova-bf upcasts every vector to "
             "float32 before scoring, so this means something upstream did not."
         )
+
+    if cscale is not None:
+        # Per-CORPUS-ROW (column) divide. Must run BEFORE the per-query divide:
+        # the unfused path divides by the corpus norm inside `_scores` and by the
+        # query norm here, and float division is not associative, so the order is
+        # part of the result. Mirrors `_cutfill`'s HAS_CNRM branch.
+        scores = scores / cscale[None, :]
 
     if scale is not None:
         # Apply the final per-query scaling before encoding score order.
@@ -194,7 +201,7 @@ PACK_TARGET_SLOTS = 1 << 28
 
 
 def pack_topk(scores, ordinal, k, scale=None, thr=None, encoded=None,
-              rank=None):
+              rank=None, cscale=None):
     """Top-K over packed `(score, ordinal)` keys. 
     
     `encoded` replaces winning column indices with their payload values.
@@ -208,12 +215,12 @@ def pack_topk(scores, ordinal, k, scale=None, thr=None, encoded=None,
 
     from nova_bf import topk_triton
 
-    if topk_triton.available(scores, ordinal, k, scale, thr, encoded):
+    if topk_triton.available(scores, ordinal, k, scale, thr, encoded, cscale):
         # Use the optimized Triton path when available; fall back permanently if
         # compilation or launch fails.
         try:
             return topk_triton.topk(scores, ordinal, k, scale, thr, encoded,
-                                    rank=rank)
+                                    rank=rank, cscale=cscale)
         except Exception as exc:
             if _is_oom(exc):
                 # OOM does not indicate an unsupported kernel configuration.
@@ -233,13 +240,18 @@ def pack_topk(scores, ordinal, k, scale=None, thr=None, encoded=None,
     n_rows, n_cols = scores.shape
     chunk = max(1, min(n_rows, PACK_TARGET_SLOTS // max(1, n_cols)))
     if chunk >= n_rows:
-        keys, idx = torch.topk(pack(scores, ordinal, scale), k=k, dim=1, sorted=False)
+        keys, idx = torch.topk(pack(scores, ordinal, scale, cscale),
+                               k=k, dim=1, sorted=False)
     else:
         key_parts, idx_parts = [], []
         for r0 in range(0, n_rows, chunk):
-            # `scale` is indexed by QUERY ROW, so it is sliced with the rows
+            # `scale` is indexed by QUERY ROW, so it is sliced with the rows.
+            # `cscale` is indexed by COLUMN and is passed WHOLE -- chunking here
+            # is over rows, so slicing it too would misalign every chunk after
+            # the first.
             block = pack(scores[r0 : r0 + chunk], ordinal,
-                         None if scale is None else scale[r0 : r0 + chunk])
+                         None if scale is None else scale[r0 : r0 + chunk],
+                         cscale)
             kp, ip = torch.topk(block, k=k, dim=1, sorted=False)
             del block
             key_parts.append(kp)
