@@ -2743,9 +2743,14 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
     # Apply stats only if the whole group loop succeeds.
     notes = []          
     thresh = twopass.threshold()
+    force = twopass.force_engage()
 
     for score_key, g in tp_groups.items():
         hint = _TP_LIVE_HINT.get(g["key"])
+        if hint is None and force:
+            # Verification runs engage before the hint exists; see
+            # twopass.force_engage(). Strictly more work, never fewer guards.
+            hint = 0.0
         if hint is None or hint > thresh:
             twopass._STATS["slices_plain"] += 1
             # One-pass scoring seeds/updates the live-fraction hint.

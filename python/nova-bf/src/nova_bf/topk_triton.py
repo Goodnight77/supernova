@@ -170,13 +170,20 @@ except Exception as exc:  # no triton, or a version whose API moved
 # A10G / Triton 3.8.0, num_warps=8: BLOCK=8192 has no spills but is near the
 # register limit (254 regs without encoded IDs). Re-measure before increasing
 # this limit or materially increasing kernel state.
-MAX_BLOCK = 8192
+# Overridable for measurement only. The default is the measured-safe value; the
+# env vars exist so a larger block can be A/B'd against it on one build rather
+# than by editing and re-deploying. Raising MAX_BLOCK without also raising the
+# warp cap DOUBLES elements-per-thread and will spill (see `_warps_for`).
+import os  # noqa: E402  (module-level env read below)
+
+MAX_BLOCK = int(os.environ.get("NOVA_BF_TOPK_MAX_BLOCK", "8192"))
+MAX_WARPS = int(os.environ.get("NOVA_BF_TOPK_MAX_WARPS", "8"))
 
 
 def _warps_for(block: int) -> int:
     """Chosen number of warps to launch for a given BLOCK.
     """
-    return max(1, min(8, block // 128))
+    return max(1, min(MAX_WARPS, block // 128))
 
 
 # Kernel offsets are computed as `base + row * row_stride + col`. Both `row`

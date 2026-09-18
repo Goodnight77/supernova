@@ -833,6 +833,7 @@ _DISABLED_REASON: str | None = None
 
 # Warn once for malformed runtime configuration values.
 _THRESHOLD_WARNED = False
+_FORCE_ENGAGE_WARNED = False
 _FUSE_CONFIG_WARNED = False
 _ROWMAX_WARNED = False
 
@@ -1021,6 +1022,33 @@ def threshold() -> float:
     if not (0.0 <= got <= 1.0):
         return _bad("is not a live fraction in [0, 1]")
     return got
+
+
+def force_engage() -> bool:
+    """Engage the two-pass on a slice whose live-fraction hint is not seeded yet.
+
+    `NOVA_BF_TWOPASS_FORCE_ENGAGE=1` treats a missing hint as 0.0. This only
+    ever makes the two-pass run MORE often; it does not force any row to be
+    pruned, which would manufacture false prunes and prove nothing. Off by
+    default, so production behaviour is unchanged.
+    """
+    global _FORCE_ENGAGE_WARNED
+    raw = os.environ.get("NOVA_BF_TWOPASS_FORCE_ENGAGE")
+    if raw is None or raw == "":
+        return False
+    v = raw.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    # Validate and warn, like `threshold()` above. An unrecognised spelling
+    # used to mean ON, so `...=off` silently removed the warm-up on a
+    # production job with no message at all.
+    if not _FORCE_ENGAGE_WARNED:
+        _FORCE_ENGAGE_WARNED = True
+        logger.warning("NOVA_BF_TWOPASS_FORCE_ENGAGE=%r is not a boolean; "
+                       "using False", raw)
+    return False
 # --- fused pass one -----------------------------------------------------------
 #
 # The fused kernel computes each query row's scaled maximum directly from the
@@ -1433,7 +1461,7 @@ def reset() -> None:
     Device-level autotuning results are retained, while caches, counters,
     certification, verification, disable state, and warn-once flags are reset.
     """
-    global _DISABLED_REASON, _FUSE_OFF, _FUSE_LAUNCHES, _VERIFY_SKIPPED, _ROWMAX_MAG_WARNED, _AUDIT_WARNED, _AUDIT_RATE, _ROWMAX_USED
+    global _DISABLED_REASON, _FUSE_OFF, _FUSE_LAUNCHES, _VERIFY_SKIPPED, _ROWMAX_MAG_WARNED, _AUDIT_WARNED, _AUDIT_RATE, _ROWMAX_USED, _FORCE_ENGAGE_WARNED
     global _THRESHOLD_WARNED, _FUSE_CONFIG_WARNED, _ROWMAX_WARNED
     global _UNCHECKED_WARNED, _ROWMAX_OFF, _FUSE_OOM_WARNED
     global _VERIFY_OOM_WARNED, _UNCHECKED_STREAK, _CERTIFIED
@@ -1443,6 +1471,9 @@ def reset() -> None:
     _SHAPE_OK.clear()
     _VERIFY_SKIPPED = False
     _DISABLED_REASON = None
+    # Per-RUN, like every other warn-once flag here: soak_twopass.run() calls
+    # reset() between configurations, and a malformed value should warn on each.
+    _FORCE_ENGAGE_WARNED = False
 
     # Retry fused execution on the next run; keep device autotuning results.
     _FUSE_OFF = None
