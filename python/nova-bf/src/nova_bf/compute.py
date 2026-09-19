@@ -1264,6 +1264,7 @@ def _reset_prune_instrumentation() -> None:
     _LIVE_STATS.clear()
     twopass.reset()
     _reset_twopass_hints()
+    _reset_certify_outcome()
     _DENSE_TRANSFER_STATS.update({
         "mode": _dense_transfer_mode(),
         "pinned_slices": 0,
@@ -2428,6 +2429,17 @@ _TP_LIVE_HINT: dict[tuple, float] = {}
 _TP_TF32_WARNED = False
 
 
+def _reset_certify_outcome() -> None:
+    """Clear the last certification outcome between runs.
+
+    A run-scoped global that no reset touched: in any process performing more
+    than one run (the sweep driver, a pytest session) the disable message could
+    report a PREVIOUS run's outcome. That is the same failure class the field
+    was added to fix -- a confidently wrong value instead of a blank one.
+    """
+    _certify_outcome[0] = None
+
+
 def _reset_twopass_hints() -> None:
     global _TP_OUT_DTYPE, _TP_TF32_WARNED
 
@@ -2439,6 +2451,43 @@ def _reset_twopass_hints() -> None:
     # Re-probe the output dtype for each run so an earlier GPU/device state
     # cannot pin the bound used by later runs.
     _TP_OUT_DTYPE = _TP_UNSET
+
+
+def _certify_budget_key(score_key, Q, device, out_dtype):
+    """The key the certification RETRY BUDGET is counted against.
+
+    Deliberately NOT `cert_key`. `cert_key` is right for certification -- a
+    different GEMM shape genuinely has to be re-certified -- but two of its
+    components churn within a run: the corpus slice height (under the default
+    `dense_batch_size=None`, `step = batch_size or n_rows`, so it is the file's
+    row count, and shards differ) and the per-file `exact_fp16`. Keying the
+    budget on it meant every file presented a fresh key with streak 0, so the
+    cap could never fire in the DEFAULT configuration -- exactly where the
+    unbounded retry it guards against is worst.
+
+    What the budget counts is "certification keeps failing for this metric, at
+    this d, on this device", and none of the churning components describe that.
+
+    A function, not an inline tuple, so a test can assert the invariance
+    directly. A source grep would be mutation-blind, which is how two earlier
+    versions of this fix went unpinned.
+    """
+    return (score_key, int(Q.shape[1]), str(device), str(out_dtype))
+
+
+# The most recent certification outcome, for the disable message in
+# `_twopass_prepare`. Deliberately NOT a `_STATS` key: `_certify_two_pass`
+# rolls those back in its `finally`, which is why the old message always
+# printed `None`.
+_certify_outcome = [None]
+
+
+def _describe_certify_outcome() -> str:
+    """The last certification outcome, for an operator-facing message."""
+    o = _certify_outcome[0]
+    if o is None:
+        return "for an unrecorded reason"
+    return o.kind + (f" ({o.reason!r})" if o.reason else "")
 
 
 def _certify_two_pass(Q, Cb, metric, col_scale, row_scale, q_norms,
@@ -2471,18 +2520,30 @@ def _certify_two_pass(Q, Cb, metric, col_scale, row_scale, q_norms,
     # Machine-health maxima intentionally survive the probe.
     before = {k: twopass._STATS[k] for k in (
         "slices_fused", "slices_unfused", "slices_pass_one_oom",
-        "slices_guard_refused", "eps_evaluations", "eps_cache_hits")}
+        "slices_guard_refused", "eps_evaluations", "eps_cache_hits",
+        "last_refusal_reason")}
     try:
-        upper, approx, eps = twopass.upper_bounds(
+        (upper, approx, eps), outcome = twopass.upper_bounds(
             Q, Cb, col_scale, row_scale, out_dtype, metric=metric,
-            with_parts=True)
-        used_fused = twopass._STATS["slices_fused"] > before["slices_fused"]
+            with_parts=True, with_outcome=True)
     finally:
         twopass._STATS.update(before)
 
-    # On CUDA, certify only when pass one's float32 accumulator is under our
-    # control; the bound cannot verify cuBLAS's requested accumulation mode.
-    if not twopass.accumulator_is_ours(Q.device, used_fused):
+    # ASK, do not infer. `upper_bounds` RETURNS what pass one did, so the three
+    # states this has to tell apart come from one value instead of being
+    # reconstructed by diffing module globals across a `finally` that rolls
+    # them back. That reconstruction produced three defects in a row; see
+    # `twopass.PassOneOutcome`.
+    _certify_outcome[0] = outcome
+    if not outcome.ran_a_kernel:
+        # INCONCLUSIVE, not a failure: nothing was computed, so there is no
+        # verdict to give about HOW it was computed. The caller retries on the
+        # next slice rather than disabling the run. Covers a guard refusal, an
+        # empty corpus, AND an allocation failure -- including one raised AFTER
+        # `slices_unfused` was incremented, which a counter delta misread as
+        # "cuBLAS ran" and turned into a permanent disable.
+        return False
+    if not outcome.accumulator_is_ours:
         return (
             "pass one would run through cuBLAS rather than the fused kernel, "
             "and the bound's gamma_d term assumes float32 accumulation that "
@@ -2764,15 +2825,51 @@ def _twopass_prepare(tp_groups, sl, spec_thr, spec_qsel, device,
         cert_key = (g["key"], int(Q.shape[0]), int(sl.Cb.shape[0]),
                     int(Q.shape[1]), str(device), str(_tp_out_dtype()),
                     bool(sl.exact_fp16))
+        budget_key = _certify_budget_key(g["key"], Q, device, _tp_out_dtype())
         if not twopass.is_certified(cert_key) and not os.environ.get(
                 "NOVA_BF_TWOPASS_NO_CERTIFY"):
             why = _certify_two_pass(
                 Q, sl.Cb, metric, col_scale, g["row_scale"], g["q_norms"],
                 _tp_out_dtype())
             if why is False:
-                # Certification was INCONCLUSIVE — no verdict either way.
+                # Certification was INCONCLUSIVE — no verdict either way. Most
+                # often no kernel ran on the probe slice, but it can also mean
+                # a kernel DID run and certification could not judge it (its
+                # own GEMM could not allocate, nothing exercised the bound, or
+                # the exact top was NaN).
                 twopass._STATS["certify_inconclusive"] += 1
+                if twopass.note_inconclusive_certification(budget_key):
+                    # Bounded, or this is worse than the bug it replaced: a
+                    # corpus whose every slice is guard-refused would re-pay
+                    # the full probe battery on every slice, forever, and
+                    # never prune. The streak clears on any slice that reaches
+                    # a verdict, so sporadic degenerate slices never get here.
+                    twopass.disable(
+                        f"certification could not be completed on "
+                        f"{twopass.MAX_INCONCLUSIVE_SLICES} consecutive "
+                        f"slices for this configuration — most recently "
+                        f"{_describe_certify_outcome()} — so retrying only "
+                        f"costs. The outcome names the cause: a *_refused or "
+                        f"oom kind means pass one produced nothing, while a "
+                        f"fused/cpu_widened kind means a kernel DID run and "
+                        f"certification could not judge it"
+                    )
+                    # RETURN only when the cap actually disabled the run:
+                    # every other `disable()` here returns `{}` so no plan
+                    # survives a disable, and the caller clears `tp_groups`
+                    # only for FUTURE slices while still consuming whatever
+                    # this call returns.
+                    #
+                    # NOT on every inconclusive certification. `tp_groups` is
+                    # keyed by (metric, scaling), so one group being refused by
+                    # a group-specific guard would otherwise discard a healthy
+                    # sibling's plan -- including the pass-two scores already
+                    # computed -- and re-score it full height on every slice.
+                    return {}
                 continue
+            # A verdict either way -- PASS or refusal -- proves certification
+            # can judge this configuration, so the streak starts over.
+            twopass.note_conclusive_certification(budget_key)
             twopass.note_certified(why, None if why else cert_key)
             if why is not None:
                 logger.warning(

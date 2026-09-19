@@ -30,6 +30,7 @@ import logging
 import math
 import os
 import threading
+import typing
 
 logger = logging.getLogger(__name__)
 
@@ -67,16 +68,39 @@ def is_certified(key: tuple) -> bool:
 #
 # Runtime probes then check the actual device for behavior inconsistent with
 # the model; passing a finite probe cannot prove the model for every input.
+# Compute capabilities the two-pass is allowed to prune on.
+#
+# THE RULE: a capability appears here only if a probe has MEASURED its
+# accumulation model on real silicon and the result JSON is committed under
+# docs/brute-force/tc-probe/results/. Theorem 1 is conditional on (R5), and an
+# unmeasured generation is an assumption about hardware we have never run,
+# dressed up as support. Inheriting a row from a paper is not measurement --
+# the T4 settled that, measuring (8,1) where the literature says Turing is
+# (4,0).
+#
+# Removing an entry is SAFE, not a regression: `probe_device_generation`
+# refuses pass one for anything absent, and a refusal falls back to the
+# one-pass fp32 path, which produces identical ground truth without the
+# speedup. Adding an entry is the change that needs evidence.
+#
+# Dropped on 2026-09-18 for having no measurement behind them:
+#   (8, 7)  Ampere, the Jetson Orin part -- no such device has ever been probed
+#   (9, 0)  Hopper H100/H200 -- the published (16, 2) row is inherited from
+#           Khattak & Mikaitis and was never measured here. Not for want of
+#           trying: 3,816 provisioning attempts across p5.4xlarge, p5.48xlarge
+#           and p5e/p5en, over nine regions, every one refused with
+#           InsufficientInstanceCapacity. AWS had no Hopper to sell that day.
+#   (10, 0) Blackwell B200  -- inherited from Khattak & Mikaitis, never run
+#   (12, 0) Blackwell, consumer -- likewise
+# Re-add any of them together with its committed probe result, not before.
+# H200 counts for (9, 0): same sm_90, same matrix unit as H100.
 _R5_GENERATIONS = {
-    (7, 0): "Volta",
-    (7, 5): "Turing",
-    (8, 0): "Ampere",
-    (8, 6): "Ampere",
-    (8, 7): "Ampere",
-    (8, 9): "Ada",
-    (9, 0): "Hopper",
-    (10, 0): "Blackwell",
-    (12, 0): "Blackwell",
+    # capability   name        measured on          evidence
+    (7, 0): "Volta",    # Tesla V100-SXM2-32GB  results/v100.json  (4,0)
+    (7, 5): "Turing",   # Tesla T4              results/t4.json    (8,1)
+    (8, 0): "Ampere",   # A100                  results/a100.json  (8,1)
+    (8, 6): "Ampere",   # A10G                  results/a10g.json  (8,1)
+    (8, 9): "Ada",      # L4                    results/l4.json    (8,1)
 }
 
 def probe_device_generation(device) -> str | None:
@@ -852,6 +876,26 @@ _UNCHECKED_WARNED = False
 MAX_UNCHECKED_SLICES = 16
 _UNCHECKED_STREAK = 0
 
+# The same shape as MAX_UNCHECKED_SLICES, deliberately a SEPARATE counter.
+# Certification can now come back INCONCLUSIVE -- no kernel ran, so there is
+# nothing to judge -- and the caller retries on the next slice instead of
+# disabling the run. Unbounded, that is worse than the bug it replaced: a
+# corpus whose every slice is guard-refused (nytimes-256: 70 zero-norm rows in
+# 102,400, so every 4096-row slice contains one) re-pays the full probe
+# battery forever and never prunes.
+#
+# NOT shared with _UNCHECKED_STREAK, for three reasons: that streak means "the
+# bit-identity check could not COMPLETE" (a resource condition) while this one
+# means "there was nothing to certify" (a data condition), so summing them
+# would trip a cap neither reached; `note_checked_slice()` resets it on an
+# unrelated event; and its disable message names the wrong mechanism.
+MAX_INCONCLUSIVE_SLICES = 16
+
+# Keyed by CONFIGURATION (`compute._certify_budget_key`), NOT by `cert_key`:
+# a streak is evidence about ONE execution
+# configuration, so a sibling group's verdict must not spend or clear it.
+_INCONCLUSIVE_STREAKS: dict = {}
+
 
 def note_unchecked_slice() -> bool:
     """Record an incomplete shape check and report whether retries must stop.
@@ -874,6 +918,38 @@ def note_checked_slice() -> None:
     """
     global _UNCHECKED_STREAK
     _UNCHECKED_STREAK = 0
+
+
+def note_inconclusive_certification(key) -> bool:
+    """Record an inconclusive certification for `key`; True when retries must
+    stop.
+
+    Consecutive slices, not a lifetime count: one degenerate slice in an
+    otherwise clean corpus must not push the run toward a disable, so any
+    slice that reaches a verdict clears the streak via
+    :func:`note_conclusive_certification`.
+
+    Per CONFIGURATION (`compute._certify_budget_key`), not per run and NOT per
+    `cert_key` -- `cert_key` carries the corpus slice height and the per-file
+    `exact_fp16`, both of which churn, which made the cap unfireable in the
+    default configuration. A run carries several execution
+    configurations; with one shared counter a healthy group would clear an
+    unhealthy sibling's streak (so its cap could never fire) and N groups per
+    slice would trip a "16 consecutive slices" cap after 16/N slices.
+    """
+    n = _INCONCLUSIVE_STREAKS.get(key, 0) + 1
+    _INCONCLUSIVE_STREAKS[key] = n
+    return n >= MAX_INCONCLUSIVE_SLICES
+
+
+def note_conclusive_certification(key) -> None:
+    """Clear `key`'s streak after a certification that reached a verdict.
+
+    Called for a PASS and for a refusal alike: both are evidence that
+    certification is able to judge this configuration, which is what the
+    streak is counting the absence of.
+    """
+    _INCONCLUSIVE_STREAKS.pop(key, None)
 
 
 def warn_unchecked_once() -> bool:
@@ -1326,6 +1402,8 @@ def fuse_usage() -> dict:
 # --- counters for the manifest -----------------------------------------------
 
 _UNMEASURED_IS_NONE = frozenset((
+    # A string, not a count: the reset loop would otherwise write integer 0.
+    "last_refusal_reason",
     "audit_closest_margin", "probe_accum_worst_rel", "shortfall_worst_ratio",
     "rowmax_worst_ratio", "dead_audit_worst",
 ))
@@ -1351,6 +1429,19 @@ _STATS = {
     # Guard refusals, and the two always-on health measurements the closed form
     # makes cheap.
     "slices_guard_refused": 0,
+    # The reason string from the most recent guard refusal, PURELY for
+    # diagnosis. Every refusal site already computes one ("corpus norm",
+    # "column scale", ...) and `_fill` used it only as a truthy flag, dropping
+    # the text -- so a declined slice said nothing about WHICH guard fired.
+    # Working that out cost three GPU round-trips on nytimes-256, and the
+    # first answer was wrong (prunability_cut blamed; norm_guard actual).
+    #
+    # NOTHING READS THIS FOR CONTROL FLOW, and it must stay that way: the
+    # decision of what pass one did is taken from the `PassOneOutcome` that
+    # `upper_bounds` RETURNS. A string that steers behaviour is a classifier,
+    # and a classifier has to be right at every site. A string that steers behaviour is a
+    # classifier, and a classifier has to be right at every site.
+    "last_refusal_reason": None,
     "rowmax_worst_ratio": None,
     "probe_accum_worst_rel": None,
     "probe_accum_fitted": 0.0,
@@ -1438,6 +1529,7 @@ def reset_stats() -> None:
         # Preserve `None` for statistics where zero would imply a measurement.
         _STATS[key] = None if key in _UNMEASURED_IS_NONE else 0
 
+
     # Clear verification status reported alongside the statistics.
     _VERIFY_SKIPPED = False
 
@@ -1497,6 +1589,7 @@ def reset() -> None:
     _FUSE_OOM_WARNED = False
     _VERIFY_OOM_WARNED = False
     _UNCHECKED_STREAK = 0
+    _INCONCLUSIVE_STREAKS.clear()
     _CERTIFIED = None
     _CERTIFIED_KEYS.clear()
 
@@ -1781,7 +1874,7 @@ def approx_rowmax(Qh, Ch, col_scale, out_dtype):
     return out, False
 
 def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
-                 cn=None, corpus_exact_fp16=None, with_parts=False):
+                 cn=None, corpus_exact_fp16=None, with_parts=False, with_outcome=False):
     """Return a safe per-query upper bound on this corpus slice's best score.
 
     Guard failures force affected rows live by returning `+inf`. An empty
@@ -1795,20 +1888,50 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
     d = int(Q.shape[1])
     dev = Q.device
 
-    def _fill(v, reason=None):
+    # The outcome travels OUT of this function rather than being reconstructed
+    # from module globals by the caller. A one-element list because the helpers
+    # below are closures, not because anything is shared.
+    # Seeded None, not a kind: every exit today assigns one, but the WRONG
+    # default here fails open. GUARD_REFUSED would mean "no kernel ran, retry",
+    # so a `return _wrap(...)` added before the success assignment would
+    # silently burn the retry budget and then disable the run naming a guard
+    # that never fired. `None` makes that a loud AssertionError instead.
+    _outcome = [None]
+
+    def _wrap(res):
+        if not with_outcome:
+            return res
+        if _outcome[0] is None:
+            # FAIL CLOSED, and not with `assert`: `python -O` strips asserts,
+            # after which this would return `(res, None)` and the caller would
+            # raise AttributeError out of `_twopass_prepare`, killing the rank
+            # mid-run instead of falling back to one-pass. A GUARD_REFUSED
+            # outcome is the safe reading -- it certifies nothing and prunes
+            # nothing -- and the reason says where to look.
+            logger.error(
+                "two-pass: upper_bounds reached a return without recording a "
+                "pass-one outcome; treating the slice as refused. A new exit "
+                "path is missing its _fill/all_live or success assignment.")
+            return (res, PassOneOutcome(PASS_ONE_GUARD_REFUSED,
+                                        "no outcome recorded"))
+        return (res, _outcome[0])
+
+    def _fill(v, reason=None, kind=PASS_ONE_GUARD_REFUSED):
         if reason:
             _STATS["slices_guard_refused"] += 1
+            _STATS["last_refusal_reason"] = reason
+        _outcome[0] = PassOneOutcome(kind, reason)
         t = torch.full((n_q,), v, dtype=torch.float32, device=dev)
 
         # Certification needs the approximate value and bound separately.
-        return ((t, t.clone(), torch.zeros_like(t)) if with_parts else t)
+        return _wrap((t, t.clone(), torch.zeros_like(t)) if with_parts else t)
 
-    def all_live(reason=None):
-        return _fill(float("inf"), reason)
+    def all_live(reason=None, kind=PASS_ONE_GUARD_REFUSED):
+        return _fill(float("inf"), reason, kind)
 
     if int(Cb.shape[0]) == 0:
         # The maximum over an empty corpus is -inf.
-        return _fill(float("-inf"))
+        return _fill(float("-inf"), kind=PASS_ONE_EMPTY)
 
     # Refuse dimensions outside the closed form's admitted range.
     if not _cf.dimension_ok(d):
@@ -1867,7 +1990,7 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
         failure = _as_pass_one_failure(exc, "the pass-one input copies")
         if isinstance(failure, PassOneUnavailable):
             _STATS["slices_pass_one_oom"] += 1
-            return all_live()
+            return all_live(kind=PASS_ONE_OOM)
         raise failure
 
     if bool(norm_guard(cn).any()):
@@ -1903,20 +2026,37 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
 
     try:
         approx, fused = approx_rowmax(qs["Qh"], Ch, col_scale, out_dtype)
+        _outcome[0] = PassOneOutcome(
+            PASS_ONE_FUSED if fused
+            else (PASS_ONE_CPU_WIDENED if not str(dev).startswith("cuda")
+                  else PASS_ONE_UNFUSED_CUBLAS))
     except PassOneUnavailable:
+        # `slices_unfused` may ALREADY have been incremented by approx_rowmax
+        # before the unfused GEMM raised, so a counter delta would read this as
+        # "cuBLAS ran" and take the hard refusal. The outcome says what
+        # happened instead of what a side effect implies.
         _STATS["slices_pass_one_oom"] += 1
-        return all_live()
+        return all_live(kind=PASS_ONE_OOM)
 
     del Ch
 
     # Only trusted accumulation paths may contribute pruning decisions.
     if not accumulator_is_ours(dev, fused):
-        return all_live("cublas accumulator")
+        # A kernel DID run and the accumulator was not ours -- a definite
+        # verdict, not an absence of one. Labelling it GUARD_REFUSED would make
+        # certification call it INCONCLUSIVE and retry forever on a box that
+        # genuinely cannot be trusted.
+        return all_live("cublas accumulator", kind=PASS_ONE_UNFUSED_CUBLAS)
 
     # Recheck mutable CUDA exact-math state for every slice.
     why = exact_math_mode_flags(dev)
     if why:
-        return all_live("exact math mode")
+        # A kernel DID run -- reaching here requires `accumulator_is_ours`
+        # above, which on CUDA means the fused path. Letting this take
+        # `all_live`'s GUARD_REFUSED default would report "no kernel ran" for a
+        # slice where one demonstrably did, and point an operator at degenerate
+        # corpus rows when the real cause is a TF32/emulation flag.
+        return all_live("exact math mode", kind=_outcome[0].kind)
 
     # Any non-finite approximate result is conservatively forced live.
     approx = torch.where(torch.isfinite(approx), approx,
@@ -1959,9 +2099,9 @@ def upper_bounds(Q, Cb, col_scale, row_scale, out_dtype, metric,
 
     if with_parts:
         # `approx` is in the same scaled units as the exact score.
-        return out, approx, eps
+        return _wrap((out, approx, eps))
 
-    return out
+    return _wrap(out)
 
 # Largest magnitude admitted for a scaled approximate cosine score.
 # Exceeding it means the pass-one result violates the bound's assumptions.
@@ -2015,6 +2155,52 @@ def _as_pass_one_failure(exc: BaseException, what: str) -> BaseException:
             pass
         return PassOneUnavailable(str(exc))
     return exc
+
+
+class PassOneOutcome(typing.NamedTuple):
+    """What pass one actually did, RETURNED rather than inferred.
+
+    The caller used to reconstruct this by diffing module-global counters
+    across the call (`slices_fused`, `slices_unfused`). That protocol rested on
+    prose-only invariants -- exactly one increment site, read before a
+    `finally` rolled the counters back -- and produced three defects in a row:
+    a whole run disabled because "no kernel ran" was read as "cuBLAS ran"; a
+    transient OOM *after* the unfused counter had already been bumped taking
+    the hard cuBLAS refusal; and a diagnostic string that was always `None`
+    because it was rolled back before the only reader saw it.
+
+    A returned value cannot be rolled back, cannot be attributed to the wrong
+    call, and cannot silently acquire a second writer.
+    """
+
+    kind: str
+    reason: str | None = None
+
+    @property
+    def ran_a_kernel(self) -> bool:
+        """Whether pass one actually computed anything.
+
+        False means there is NOTHING to say about how the accumulation was
+        done -- not that it was done badly. Conflating the two is what
+        disabled a 102,400-row run over 70 degenerate rows.
+        """
+        return self.kind in (PASS_ONE_FUSED, PASS_ONE_CPU_WIDENED,
+                             PASS_ONE_UNFUSED_CUBLAS)
+
+    @property
+    def accumulator_is_ours(self) -> bool:
+        """Whether the float32 accumulation the bound assumes was under our
+        control. Only meaningful when `ran_a_kernel`."""
+        return self.kind in (PASS_ONE_FUSED, PASS_ONE_CPU_WIDENED)
+
+
+# Pass-one outcome kinds.
+PASS_ONE_FUSED = "fused"                    # our float32 accumulator
+PASS_ONE_CPU_WIDENED = "cpu_widened"        # our float32, widened on CPU
+PASS_ONE_UNFUSED_CUBLAS = "unfused_cublas"  # cuBLAS ran; accumulation not ours
+PASS_ONE_GUARD_REFUSED = "guard_refused"    # no kernel ran; carries a reason
+PASS_ONE_OOM = "oom"                        # no usable result; transient
+PASS_ONE_EMPTY = "empty"                    # empty corpus; -inf is a real answer
 
 
 class PassOneUnavailable(Exception):

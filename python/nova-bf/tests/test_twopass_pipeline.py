@@ -812,9 +812,18 @@ def test_a_pass_one_oom_does_not_fabricate_a_live_hint(ds, tmp_path, monkeypatch
                               dtype=torch.float32, device=Q.device)
             # `with_parts` is what certification asks for; an all-live return
             # has no pass one, so the parts are the refusal and a zero bound.
-            if kw.get("with_parts"):
-                return live, live, torch.zeros_like(live)
-            return live
+            res = ((live, live, torch.zeros_like(live))
+                   if kw.get("with_parts") else live)
+            # `with_outcome` too. `_certify_two_pass` unpacks `(result,
+            # outcome)`, so a bare result raises ValueError *out of*
+            # `_twopass_prepare` and kills the run. This passed only by luck of
+            # ordering: of 23 upper_bounds calls exactly one asks for the
+            # outcome, and OOM_ON happens not to be it. Changing OOM_ON, adding
+            # a second score group, or anything that re-certifies mid-run would
+            # turn this into a ValueError that looks like a product bug.
+            if kw.get("with_outcome"):
+                return res, twopass.PassOneOutcome(twopass.PASS_ONE_OOM)
+            return res
         return real(Q, Cb, col_scale, row_scale, out_dtype, **kw)
 
     class Recording(dict):
